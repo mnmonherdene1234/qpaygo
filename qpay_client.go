@@ -3,29 +3,27 @@ package qpaygo
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"time"
 )
 
-// QPay үйлчилгээний үндсэн API хаяг
 const (
 	DefaultHost = "https://merchant.qpay.mn"
 )
 
-// QpayClient нь QPay төлбөрийн API-тай харилцахад ашиглагдана
-type QpayClient struct {
+type QPayClient struct {
 	Username      string
 	Password      string
 	InvoiceCode   string
 	Client        *http.Client
-	TokenResponse *QPayTokenResponse
+	TokenResponse *TokenResponse
 	Host          string
 }
 
-// NewQpayClient нь шинэ QpayClient үүсгэж буцаана
-func NewQpayClient(username, password, invoiceCode string) *QpayClient {
-
-	qpayClient := &QpayClient{
+func NewQPayClient(username, password, invoiceCode string) (*QPayClient, error) {
+	client := &QPayClient{
 		Username:    username,
 		Password:    password,
 		InvoiceCode: invoiceCode,
@@ -33,21 +31,22 @@ func NewQpayClient(username, password, invoiceCode string) *QpayClient {
 		Host:        DefaultHost,
 	}
 
-	qpayClient.AuthToken()
+	if err := client.AuthToken(); err != nil {
+		return nil, err
+	}
 
-	return qpayClient
+	return client, nil
 }
 
-// AuthToken нь QPay API-аас шинэ хандалтын токен авна
-func (q *QpayClient) AuthToken() error {
-	authURL := q.Host + "/v2/auth/token"
+func (q *QPayClient) AuthToken() error {
+	authURL := fmt.Sprintf("%s/v2/auth/token", q.Host)
+	authHeader := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", q.Username, q.Password)))
 
-	// Үндсэн аутентификацийн толгой үүсгэнэ
-	authHeader := base64.StdEncoding.EncodeToString(fmt.Appendf(nil, "%s:%s", q.Username, q.Password))
-	request, err := http.NewRequest("POST", authURL, nil)
+	request, err := http.NewRequest(http.MethodPost, authURL, nil)
 	if err != nil {
 		return err
 	}
+
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Authorization", "Basic "+authHeader)
 
@@ -57,7 +56,41 @@ func (q *QpayClient) AuthToken() error {
 	}
 	defer response.Body.Close()
 
-	if err := json.NewDecoder(response.Body).Decode(q.TokenResponse); err != nil {
+	if response.StatusCode != http.StatusOK {
+		return errors.New("failed to authenticate")
+	}
+
+	if err := json.NewDecoder(response.Body).Decode(&q.TokenResponse); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (q *QPayClient) IsTokenExpired() bool {
+	if q.TokenResponse == nil || q.TokenResponse.AccessToken == "" || q.TokenResponse.ExpiresIn == 0 {
+		return true
+	}
+
+	expirationTime := time.Unix(q.TokenResponse.ExpiresIn, 0)
+	return time.Now().After(expirationTime)
+}
+
+func (q *QPayClient) CheckTokenAndRefresh() error {
+	if q.IsTokenExpired() {
+		if err := q.AuthToken(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (q *QPayClient) CreateAmountInvoice(
+	senderInvoiceNo, invoiceReceiverCode, description string,
+	amount float64, callbackURL string,
+) error {
+	if err := q.CheckTokenAndRefresh(); err != nil {
 		return err
 	}
 

@@ -1,13 +1,17 @@
 package qpaygo
 
 import (
-	"net/http"
+	"log"
 	"testing"
 )
 
 func TestNewQpayClient(t *testing.T) {
 
-	client := NewQpayClient(Username, Password, InvoiceCode)
+	client, err := NewQPayClient(Username, Password, InvoiceCode)
+
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
 
 	if client.Username != Username {
 		t.Errorf("expected Username %s, got %s", Username, client.Username)
@@ -24,14 +28,13 @@ func TestNewQpayClient(t *testing.T) {
 }
 
 func TestAuthToken(t *testing.T) {
-	client := &QpayClient{
-		Username:    Username,
-		Password:    Password,
-		InvoiceCode: InvoiceCode,
-		Client:      &http.Client{},
+	client, err := NewQPayClient(Username, Password, InvoiceCode)
+
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
 	}
 
-	err := client.AuthToken()
+	err = client.AuthToken()
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
@@ -39,4 +42,6 @@ func TestAuthToken(t *testing.T) {
 	if client.TokenResponse == nil {
 		t.Fatalf("expected token response, got nil")
 	}
+
+	log.Println(client.TokenResponse.AccessToken)
 }
