@@ -118,7 +118,7 @@ func TestGetInvoice(t *testing.T) {
 		t.Fatalf("expected no error, got %v", err)
 	}
 
-	response, err := client.GetInvoice("0c32b23f-f162-4caf-94dd-09a49952a9ba")
+	response, err := client.GetInvoice("8a712739-ac1e-4739-8bd3-3826a5746107")
 
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)

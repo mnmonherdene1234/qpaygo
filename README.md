@@ -2,6 +2,12 @@
 
 Энэ нь qpay.mn-ийн ашиглалтад зориулагдсан бөгөөд Golang орчинд QPay үйлчилгээг хэрэглэхэд тусална.
 
+## Татаж
+
+```base
+go get github.com/mnmonherdene1234/qpaygo
+```
+
 ## Шинэ QPay Client үүсгэх
 
 Шинэ QPay Client үүсгэх:
