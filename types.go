@@ -1,77 +1,93 @@
 package qpaygo
 
+import (
+	"fmt"
+	"strconv"
+	"strings"
+)
+
+// Number represents a decimal amount or quantity. QPay's v2 API encodes the
+// same logical field inconsistently across (and sometimes within) endpoints:
+// as a bare JSON number (e.g. 100.5) or as a quoted numeric string (e.g.
+// "100.50"). UnmarshalJSON accepts either; MarshalJSON always emits a bare
+// JSON number.
+type Number float64
+
+// Float64 returns n as a float64.
+func (n Number) Float64() float64 { return float64(n) }
+
+func (n *Number) UnmarshalJSON(data []byte) error {
+	s := strings.TrimSpace(string(data))
+	if s == "null" || s == "" {
+		*n = 0
+		return nil
+	}
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		s = s[1 : len(s)-1]
+		if s == "" {
+			*n = 0
+			return nil
+		}
+	}
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return fmt.Errorf("qpaygo: invalid number %q: %w", s, err)
+	}
+	*n = Number(f)
+	return nil
+}
+
+func (n Number) MarshalJSON() ([]byte, error) {
+	return []byte(strconv.FormatFloat(float64(n), 'f', -1, 64)), nil
+}
+
+// TokenResponse is the OAuth2/Keycloak-style token payload returned by
+// POST /v2/auth/token and POST /v2/auth/refresh.
 type TokenResponse struct {
-	TokenType        string `json:"token_type"`         // Токены төрөл
-	RefreshExpiresIn int64  `json:"refresh_expires_in"` // Шинэчлэх хугацаа дуусах хугацаа (секундээр)
-	RefreshToken     string `json:"refresh_token"`      // Шинэчлэх токен
-	AccessToken      string `json:"access_token"`       // Нэвтрэх токен
-	ExpiresIn        int64  `json:"expires_in"`         // Хугацаа дуусах хугацаа (секундээр)
-	Scope            string `json:"scope"`              // Хүрээ
-	NotBeforePolicy  string `json:"not-before-policy"`  // Бодлого эхлэх хугацаа
-	SessionState     string `json:"session_state"`      // Сессийн төлөв
+	TokenType        string `json:"token_type"`
+	RefreshExpiresIn int64  `json:"refresh_expires_in"`
+	RefreshToken     string `json:"refresh_token"`
+	AccessToken      string `json:"access_token"`
+	ExpiresIn        int64  `json:"expires_in"`
+	Scope            string `json:"scope"`
+	NotBeforePolicy  string `json:"not-before-policy"`
+	SessionState     string `json:"session_state"`
 }
 
-type CreateAmountInvoiceRequest struct {
-	InvoiceCode         string `json:"invoice_code"`          // QPay-ээс өгсөн нэхэмжлэхийн код
-	SenderInvoiceNo     string `json:"sender_invoice_no"`     // Байгууллагаас үүсгэх давтагдашгүй нэхэмжлэлийн дугаар
-	InvoiceReceiverCode string `json:"invoice_receiver_code"` // Байгууллагын нэхэмжлэхийг хүлээн авч буй харилцагчийн дахин давтагдашгүй дугаар
-	InvoiceDescription  string `json:"invoice_description"`   // Нэхэмжлэлийн утга, гүйлгээний утга
-	Amount              uint   `json:"amount"`                // Мөнгөн дүн
-	CallbackURL         string `json:"callback_url"`          // Төлбөр амжилттай төлөгдсөн тохиолдолд дуудагдах URL
-}
+// TransportType identifies whether a payment moved via a P2P bank transfer or
+// a card network. QPay names the JSON field carrying this value differently
+// per endpoint: transaction_type (GetPayment), payment_type (CheckPayment),
+// paid_by (ListPayments, eBarimt) — the values themselves are consistent.
+type TransportType string
 
-type URL struct {
-	Name        string `json:"name"`        // нэр
-	Description string `json:"description"` // тайлбар
-	Logo        string `json:"logo"`        // лого
-	Link        string `json:"link"`        // хаяг
-}
+const (
+	TransportP2P  TransportType = "P2P"
+	TransportCard TransportType = "CARD"
+)
 
-type CreateAmountInvoiceResponse struct {
-	InvoiceID    string `json:"invoice_id"`    // Нэхэмжлэлийн дугаар
-	QRText       string `json:"qr_text"`       // QR кодны текст
-	QRImage      string `json:"qr_image"`      // QR кодны зураг
-	QPayShortURL string `json:"qPay_shortUrl"` // QPay-н товчлол
-	URLs         []URL  `json:"urls"`          // Линкүүд
-}
+// PaymentStatus is QPay's payment lifecycle state.
+type PaymentStatus string
 
-type Line struct {
-	TaxProductCode  string `json:"tax_product_code"` // Татварын бүтээгдэхүүний код
-	LineDescription string `json:"line_description"` // Мөрийн тайлбар
-	LineQuantity    string `json:"line_quantity"`    // Мөрийн тоо хэмжээ
-	LineUnitPrice   string `json:"line_unit_price"`  // Мөрийн нэгж үнэ
-	Note            string `json:"note"`             // Тэмдэглэл
-	Discounts       []any  `json:"discounts"`        // Хөнгөлөлтүүд
-	Surcharges      []any  `json:"surcharges"`       // Нэмэлт төлбөрүүд
-	Taxes           []any  `json:"taxes"`            // Татварууд
-}
+const (
+	PaymentStatusNew      PaymentStatus = "NEW"
+	PaymentStatusFailed   PaymentStatus = "FAILED"
+	PaymentStatusPaid     PaymentStatus = "PAID"
+	PaymentStatusPartial  PaymentStatus = "PARTIAL"
+	PaymentStatusRefunded PaymentStatus = "REFUNDED"
+)
 
-type GetInvoiceResponse struct {
-	InvoiceID          string  `json:"invoice_id"`           // Нэхэмжлэлийн дугаар
-	InvoiceStatus      string  `json:"invoice_status"`       // Нэхэмжлэлийн төлөв ("OPEN" | "CLOSED")
-	SenderInvoiceNo    string  `json:"sender_invoice_no"`    // Байгууллагаас үүсгэх давтагдашгүй нэхэмжлэлийн дугаар
-	SenderBranchCode   string  `json:"sender_branch_code"`   // Байгууллагын салбарын код
-	SenderBranchData   string  `json:"sender_branch_data"`   // Байгууллагын салбарын мэдээлэл
-	SenderStaffCode    string  `json:"sender_staff_code"`    // Байгууллагын ажилтны код
-	SenderStaffData    string  `json:"sender_staff_data"`    // Байгууллагын ажилтны мэдээлэл
-	SenderTerminalCode string  `json:"sender_terminal_code"` // Байгууллагын терминалын код
-	SenderTerminalData string  `json:"sender_terminal_data"` // Байгууллагын терминалын мэдээлэл
-	InvoiceDescription string  `json:"invoice_description"`  // Нэхэмжлэлийн утга, гүйлгээний утга
-	InvoiceDueDate     string  `json:"invoice_due_date"`     // Нэхэмжлэлийн дуусах хугацаа
-	EnableExpiry       bool    `json:"enable_expiry"`        // Дуусах хугацааг идэвхжүүлэх эсэх
-	ExpiryDate         string  `json:"expiry_date"`          // Дуусах хугацаа
-	AllowPartial       bool    `json:"allow_partial"`        // Хэсэгчлэн төлөхийг зөвшөөрөх эсэх
-	MinimumAmount      float64 `json:"minimum_amount"`       // Хамгийн бага дүн
-	AllowExceed        bool    `json:"allow_exceed"`         // Хэтрүүлэхийг зөвшөөрөх эсэх
-	MaximumAmount      string  `json:"maximum_amount"`       // Хамгийн их дүн
-	TotalAmount        string  `json:"total_amount"`         // Нийт дүн
-	GrossAmount        uint    `json:"gross_amount"`         // Нийт дүн
-	TaxAmount          uint    `json:"tax_amount"`           // Татварын дүн
-	SurchargeAmount    uint    `json:"surcharge_amount"`     // Нэмэлт төлбөрийн дүн
-	DiscountAmount     uint    `json:"discount_amount"`      // Хөнгөлөлтийн дүн
-	CallbackURL        string  `json:"callback_url"`         // Төлбөр амжилттай төлөгдсөн тохиолдолд дуудагдах URL
-	Note               string  `json:"note"`                 // Тэмдэглэл
-	Lines              []Line  `json:"lines"`                // Мөрүүд
-	Transactions       []any   `json:"transactions"`         // Гүйлгээ
-	Inputs             []any   `json:"inputs"`               // Оролтууд
+// ObjectType identifies what a payment lookup is scoped to.
+type ObjectType string
+
+const (
+	ObjectTypeInvoice  ObjectType = "INVOICE"
+	ObjectTypeQR       ObjectType = "QR"
+	ObjectTypeItem     ObjectType = "ITEM"     // valid for CheckPayment only
+	ObjectTypeMerchant ObjectType = "MERCHANT" // valid for ListPayments only
+)
+
+// Offset paginates payment/check and payment/list requests.
+type Offset struct {
+	PageNumber int `json:"page_number"`
+	PageLimit  int `json:"page_limit"`
 }
