@@ -7,7 +7,13 @@ import (
 	"time"
 )
 
-// CardTransaction is a card-network transaction leg of a payment.
+// CardTransaction is a card-network transaction leg of a payment as returned
+// by GET /v2/payment/:payment_id.
+//
+// QPay's payment/check rows document a DIFFERENT, smaller card shape
+// ({card_type, is_cross_border, amount, currency, date, status, ...}), which
+// is why this struct additionally accepts the check-row aliases amount /
+// currency / date / status (see the fields' comments).
 type CardTransaction struct {
 	CardMerchantCode     string `json:"card_merchant_code"`
 	CardTerminalCode     string `json:"card_terminal_code"`
@@ -20,10 +26,20 @@ type CardTransaction struct {
 	TransactionStatus    string `json:"transaction_status"`
 	SettlementStatus     string `json:"settlement_status"`
 	SettlementStatusDate string `json:"settlement_status_date"`
+
+	// Check-row aliases: QPay's payment/check table (and its JSON examples)
+	// name the fields amount/currency/date/status instead of the
+	// transaction_* names used by payment GET. Accepting both keeps card
+	// rows from either endpoint from silently decoding to zero values.
+	Amount   Number `json:"amount"`
+	Currency string `json:"currency"`
+	Date     string `json:"date"`
+	Status   string `json:"status"`
 }
 
 // P2PTransaction is a bank-transfer transaction leg of a payment.
 type P2PTransaction struct {
+	ID                  string `json:"id"`
 	TransactionBankCode string `json:"transaction_bank_code"`
 	AccountBankCode     string `json:"account_bank_code"`
 	AccountBankName     string `json:"account_bank_name"`
@@ -69,11 +85,15 @@ func (q *QPayClient) GetPayment(ctx context.Context, paymentID string) (*GetPaym
 	return requestJSON[GetPaymentResponse](ctx, q, http.MethodGet, "/v2/payment/"+url.PathEscape(paymentID), nil)
 }
 
-// CheckPaymentRequest is the request body for CheckPayment.
+// CheckPaymentRequest is the request body for CheckPayment. Offset is
+// optional: a nil Offset is omitted from the wire body entirely (QPay accepts
+// that), while an explicit zero Offset would be rejected by QPay's
+// MIN_NUMBER validation — always set PageNumber/PageLimit to [1,100] when
+// paginating.
 type CheckPaymentRequest struct {
 	ObjectType ObjectType `json:"object_type"` // INVOICE | QR | ITEM
 	ObjectID   string     `json:"object_id"`
-	Offset     Offset     `json:"offset"`
+	Offset     *Offset    `json:"offset,omitempty"`
 }
 
 // PaymentCheckRow is one payment row within a CheckPaymentResponse.
@@ -81,6 +101,7 @@ type PaymentCheckRow struct {
 	PaymentID           string            `json:"payment_id"`
 	PaymentStatus       PaymentStatus     `json:"payment_status"`
 	PaymentAmount       Number            `json:"payment_amount"`
+	EbarimtCustomerNo   string            `json:"ebarimt_customer_no"`
 	TrxFee              Number            `json:"trx_fee"`
 	PaymentCurrency     string            `json:"payment_currency"`
 	PaymentWallet       string            `json:"payment_wallet"`
@@ -134,30 +155,34 @@ func (q *QPayClient) RefundPayment(ctx context.Context, paymentID string, req Re
 	return requestEmpty(ctx, q, http.MethodDelete, "/v2/payment/refund/"+url.PathEscape(paymentID), req)
 }
 
-// ListPaymentsRequest is the request body for ListPayments.
+// ListPaymentsRequest is the request body for ListPayments. A nil Offset is
+// replaced with {1, 100} before sending — QPay requires offset for this
+// endpoint and rejects zero values.
 type ListPaymentsRequest struct {
 	ObjectType ObjectType `json:"object_type"` // MERCHANT | INVOICE | QR
 	ObjectID   string     `json:"object_id"`
 	StartDate  string     `json:"start_date"` // "YYYY-MM-DD HH:mm:ss"
 	EndDate    string     `json:"end_date"`
-	Offset     Offset     `json:"offset"`
+	Offset     *Offset    `json:"offset"`
 }
 
 // PaymentListRow is one payment row within a ListPaymentsResponse.
 type PaymentListRow struct {
-	PaymentID          string        `json:"payment_id"`
-	PaymentDate        string        `json:"payment_date"`
-	PaymentStatus      PaymentStatus `json:"payment_status"`
-	PaymentFee         Number        `json:"payment_fee"`
-	PaymentAmount      Number        `json:"payment_amount"`
-	PaymentCurrency    string        `json:"payment_currency"`
-	PaymentWallet      string        `json:"payment_wallet"`
-	PaymentName        string        `json:"payment_name"`
-	PaymentDescription string        `json:"payment_description"`
-	QRCode             string        `json:"qr_code"`
-	TransportType      TransportType `json:"paid_by"`
-	ObjectType         ObjectType    `json:"object_type"`
-	ObjectID           string        `json:"object_id"`
+	PaymentID           string        `json:"payment_id"`
+	PaymentDate         string        `json:"payment_date"`
+	PaymentStatus       PaymentStatus `json:"payment_status"`
+	PaymentFee          Number        `json:"payment_fee"`
+	PaymentAmount       Number        `json:"payment_amount"`
+	PaymentCurrency     string        `json:"payment_currency"`
+	PaymentWallet       string        `json:"payment_wallet"`
+	PaymentName         string        `json:"payment_name"`
+	PaymentDescription  string        `json:"payment_description"`
+	QRCode              string        `json:"qr_code"`
+	TransportType       TransportType `json:"paid_by"`
+	ObjectType          ObjectType    `json:"object_type"`
+	ObjectID            string        `json:"object_id"`
+	NextPaymentDate     string        `json:"next_payment_date"`
+	NextPaymentDatetime string        `json:"next_payment_datetime"`
 }
 
 // ListPaymentsResponse is returned by ListPayments.
@@ -168,7 +193,15 @@ type ListPaymentsResponse struct {
 
 // ListPayments lists payments for a merchant/invoice/QR within a date range
 // via POST /v2/payment/list.
+//
+// Note on object_id: for ObjectTypeInvoice/QR it is the invoice_code/QR id;
+// for ObjectTypeMerchant it is the merchant UUID carried in the access
+// token's JWT "merchant_id" claim (NOT the invoice code — QPay returns
+// 401 PERMISSION_DENIED otherwise).
 func (q *QPayClient) ListPayments(ctx context.Context, req ListPaymentsRequest) (*ListPaymentsResponse, error) {
+	if req.Offset == nil {
+		req.Offset = &Offset{PageNumber: 1, PageLimit: 100}
+	}
 	return requestJSON[ListPaymentsResponse](ctx, q, http.MethodPost, "/v2/payment/list", req)
 }
 

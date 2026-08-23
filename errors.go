@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 )
 
@@ -15,7 +16,8 @@ import (
 // to be incomplete. Some values below carry QPay's own documented spelling
 // even where it looks like a typo (e.g. ErrEbarimtCancelNotSupported,
 // ErrNoCredentials), since these are the literal values QPay sends on the
-// wire.
+// wire. Other spellings (ErrNoCredentialsProduction, ErrSystemBusy, ...)
+// were captured from live production/sandbox responses.
 type ErrorCode string
 
 const (
@@ -25,6 +27,7 @@ const (
 	ErrBankAccountNotFound                ErrorCode = "BANK_ACCOUNT_NOTFOUND"
 	ErrBankMCCAlreadyAdded                ErrorCode = "BANK_MCC_ALREADY_ADDED"
 	ErrBankMCCNotFound                    ErrorCode = "BANK_MCC_NOT_FOUND"
+	ErrBarimtNotFound                     ErrorCode = "BARIMT_NOT_FOUND" // observed live: GET /v2/ebarimt on an unknown id (422)
 	ErrCardTerminalNotFound               ErrorCode = "CARD_TERMINAL_NOTFOUND"
 	ErrClientNotFound                     ErrorCode = "CLIENT_NOTFOUND"
 	ErrClientUsernameDuplicated           ErrorCode = "CLIENT_USERNAME_DUPLICATED"
@@ -55,7 +58,8 @@ const (
 	ErrMerchantInactive                   ErrorCode = "MERCHANT_INACTIVE"
 	ErrMerchantNotFound                   ErrorCode = "MERCHANT_NOTFOUND"
 	ErrMinAmount                          ErrorCode = "MIN_AMOUNT_ERR"
-	ErrNoCredentials                      ErrorCode = "NO_CREDENDIALS" // sic
+	ErrNoCredentials                      ErrorCode = "NO_CREDENDIALS" // sic — QPay's documented (sandbox) spelling
+	ErrNoCredentialsProduction            ErrorCode = "NO_CREDENTIALS" // observed live: production returns this for a missing/invalid bearer token (401)
 	ErrObjectDataError                    ErrorCode = "OBJECT_DATA_ERROR"
 	ErrP2PTerminalNotFound                ErrorCode = "P2P_TERMINAL_NOTFOUND"
 	ErrPaymentAlreadyCanceled             ErrorCode = "PAYMENT_ALREADY_CANCELED"
@@ -68,10 +72,12 @@ const (
 	ErrQRCodeNotFound                     ErrorCode = "QRCODE_NOTFOUND"
 	ErrQRCodeUsed                         ErrorCode = "QRCODE_USED"
 	ErrSenderBranchDataRequired           ErrorCode = "SENDER_BRANCH_DATA_REQUIRED"
+	ErrSystemBusy                         ErrorCode = "SYSTEM_BUSY" // observed live: sandbox/production return this (500) for e.g. cancel-ebarimt on an unknown id
 	ErrTaxLineRequired                    ErrorCode = "TAX_LINE_REQUIRED"
 	ErrTaxProductCodeRequired             ErrorCode = "TAX_PRODUCT_CODE_REQUIRED"
 	ErrTransactionNotApproved             ErrorCode = "TRANSACTION_NOT_APPROVED"
 	ErrTransactionRequired                ErrorCode = "TRANSACTION_REQUIRED"
+	ErrTypeError                          ErrorCode = "TypeError" // observed live: sandbox ebarimt create returns this (500) — a QPay server-side defect, not client-actionable
 )
 
 // APIError represents a non-2xx response from QPay's API. When QPay's
@@ -88,6 +94,9 @@ type APIError struct {
 func (e *APIError) Error() string {
 	if e.Code != "" {
 		return fmt.Sprintf("qpaygo: %s (http %d): %s", e.Code, e.StatusCode, e.Message)
+	}
+	if e.Message != "" {
+		return fmt.Sprintf("qpaygo: http %d: %s", e.StatusCode, e.Message)
 	}
 	return fmt.Sprintf("qpaygo: http %d: %s", e.StatusCode, e.Body)
 }
@@ -109,15 +118,102 @@ func parseAPIError(response *http.Response) *APIError {
 		apiErr.Body = response.Status
 	}
 
+	// QPay's documented error shape is {"error": "<CODE>", "message": "..."},
+	// but live responses show two deviations:
+	//   1. the values may be nested OBJECTS (field-validation failures, e.g.
+	//      {"error":{"page_limit":{"type":"MIN_NUMBER","message":"..."}}}),
+	//      in which case there is no single code — the object is flattened
+	//      into Message;
+	//   2. the spelling of codes may differ per environment
+	//      (NO_CREDENDIALS vs NO_CREDENTIALS), which is why Code is stored
+	//      as the raw wire string rather than being forced into a constant.
 	var wire struct {
-		Error   string `json:"error"`
-		Message string `json:"message"`
+		Error   json.RawMessage `json:"error"`
+		Message json.RawMessage `json:"message"`
 	}
-	if json.Unmarshal(body, &wire) == nil && wire.Error != "" {
-		apiErr.Code = ErrorCode(wire.Error)
-		apiErr.Message = wire.Message
+	if json.Unmarshal(body, &wire) == nil {
+		if code, ok := jsonRawText(wire.Error); ok && code != "" {
+			apiErr.Code = ErrorCode(code)
+		} else if len(wire.Error) > 0 {
+			apiErr.Message = flattenErrorObject(wire.Error)
+		}
+		if msg, ok := jsonRawText(wire.Message); ok && msg != "" {
+			apiErr.Message = msg
+		} else if len(wire.Message) > 0 && apiErr.Message == "" {
+			apiErr.Message = flattenErrorObject(wire.Message)
+		}
 	}
 	return apiErr
+}
+
+// jsonRawText returns the string value of a JSON string literal, or ("", false)
+// when raw is not a string literal (e.g. an object, number, null, or empty).
+func jsonRawText(raw json.RawMessage) (string, bool) {
+	if len(raw) == 0 {
+		return "", false
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return "", false
+	}
+	return s, true
+}
+
+// flattenErrorObject converts an object-shaped error value into a readable
+// single-line string, e.g.
+//
+//	{"page_limit":{"type":"MIN_NUMBER","message":"Number min value [1]!"}}
+//	→ "page_limit: MIN_NUMBER: Number min value [1]!"
+//
+// Nested values are handled recursively; keys are sorted for determinism.
+// An object of the shape {"type": "...", "message": "..."} is rendered as
+// "type: message".
+func flattenErrorObject(raw json.RawMessage) string {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		// Not an object; fall back to the compact raw form.
+		var compact any
+		if err := json.Unmarshal(raw, &compact); err != nil {
+			return string(raw)
+		}
+		if b, err := json.Marshal(compact); err == nil {
+			return string(b)
+		}
+		return string(raw)
+	}
+
+	if len(obj) == 2 {
+		if typ, ok := jsonRawText(obj["type"]); ok {
+			if msg, ok := jsonRawText(obj["message"]); ok {
+				if typ != "" && msg != "" {
+					return typ + ": " + msg
+				}
+				if msg != "" {
+					return msg
+				}
+			}
+			if typ != "" {
+				return typ
+			}
+		}
+	}
+
+	keys := make([]string, 0, len(obj))
+	for k := range obj {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	parts := make([]string, 0, len(obj))
+	for _, k := range keys {
+		v := obj[k]
+		if s, ok := jsonRawText(v); ok {
+			parts = append(parts, k+": "+s)
+			continue
+		}
+		parts = append(parts, k+": "+flattenErrorObject(v))
+	}
+	return strings.Join(parts, "; ")
 }
 
 func isSuccess(statusCode int) bool {
@@ -131,6 +227,13 @@ func decodeJSONResponse(response *http.Response, dst any) error {
 
 	if !isSuccess(response.StatusCode) {
 		return parseAPIError(response)
+	}
+
+	if response.StatusCode == http.StatusNoContent {
+		// QPay's endpoints that return JSON always return a body today, but
+		// guard against a bare 204 so callers get a clear error instead of a
+		// confusing "EOF" from the decoder.
+		return fmt.Errorf("qpaygo: unexpected 204 No Content response (endpoint returned no JSON body)")
 	}
 
 	return json.NewDecoder(response.Body).Decode(dst)

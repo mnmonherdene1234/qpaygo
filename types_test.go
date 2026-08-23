@@ -2,6 +2,7 @@ package qpaygo
 
 import (
 	"encoding/json"
+	"math"
 	"testing"
 )
 
@@ -70,5 +71,33 @@ func TestNumberRoundTrip(t *testing.T) {
 	}
 	if string(data) != `{"amount":250}` {
 		t.Fatalf("got %s, want {\"amount\":250}", data)
+	}
+}
+
+func TestNumberRejectsNonFiniteOnMarshal(t *testing.T) {
+	for _, n := range []Number{Number(math.NaN()), Number(math.Inf(1)), Number(math.Inf(-1))} {
+		if _, err := json.Marshal(n); err == nil {
+			t.Fatalf("expected error marshaling non-finite Number %v, got nil", n)
+		}
+	}
+}
+
+func TestNumberRejectsNonFiniteOnUnmarshal(t *testing.T) {
+	for _, in := range []string{`"NaN"`, `"+Inf"`, `"-Inf"`, `"Inf"`, `NaN`, `+Inf`} {
+		var n Number
+		err := json.Unmarshal([]byte(in), &n)
+		if err == nil {
+			t.Fatalf("expected error unmarshaling %q, got %v", in, n)
+		}
+	}
+}
+
+func TestNumberPoisonedValueCannotEnterStruct(t *testing.T) {
+	type wrapper struct {
+		Amount Number `json:"amount"`
+	}
+	var w wrapper
+	if err := json.Unmarshal([]byte(`{"amount":"NaN"}`), &w); err == nil {
+		t.Fatal("expected unmarshal of poisoned NaN to fail")
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -182,5 +183,149 @@ func TestCancelInvoiceAlreadyCanceled(t *testing.T) {
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) || apiErr.Code != ErrInvoiceAlreadyCanceled {
 		t.Fatalf("got err %v", err)
+	}
+}
+
+func TestInvoiceResponseDecodesQPayDeeplinkAlias(t *testing.T) {
+	// QPay's official field table names the deeplink array "qPay_deeplink"
+	// while the live API sends "urls". Both must populate URLs.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v2/invoice", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"invoice_id": "inv-dl",
+			"qr_text": "0002010102...",
+			"qr_image": "aGVsbG8=",
+			"qPay_shortUrl": "https://s.qpay.mn/z1lKnIO5T",
+			"qPay_deeplink": [
+				{"name":"Khan bank","description":"Хаан банк","logo":"https://qpay.mn/q/logo/khanbank.png","link":"khanbank://q?qPay_QRcode=abc"}
+			]
+		}`))
+	})
+	client, _ := newMockClient(t, mux)
+
+	resp, err := client.CreateSimpleInvoice(context.Background(), CreateSimpleInvoiceRequest{
+		SenderInvoiceNo:     "inv-dl",
+		InvoiceReceiverCode: "r",
+		InvoiceDescription:  "d",
+		Amount:              100,
+		CallbackURL:         "https://example.com/cb",
+	})
+	if err != nil {
+		t.Fatalf("CreateSimpleInvoice: %v", err)
+	}
+	if len(resp.URLs) != 1 || resp.URLs[0].Name != "Khan bank" {
+		t.Fatalf("qPay_deeplink must populate URLs, got %+v", resp.URLs)
+	}
+}
+
+func TestInvoiceResponsePrefersURLsOverDeeplink(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v2/invoice", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"invoice_id": "inv-both",
+			"urls": [{"name":"from urls","description":"","logo":"","link":""}],
+			"qPay_deeplink": [{"name":"from deeplink","description":"","logo":"","link":""}]
+		}`))
+	})
+	client, _ := newMockClient(t, mux)
+
+	resp, err := client.CreateSimpleInvoice(context.Background(), CreateSimpleInvoiceRequest{
+		SenderInvoiceNo:     "inv-both",
+		InvoiceReceiverCode: "r",
+		InvoiceDescription:  "d",
+		Amount:              100,
+		CallbackURL:         "https://example.com/cb",
+	})
+	if err != nil {
+		t.Fatalf("CreateSimpleInvoice: %v", err)
+	}
+	if len(resp.URLs) != 1 || resp.URLs[0].Name != "from urls" {
+		t.Fatalf("urls must win over qPay_deeplink, got %+v", resp.URLs)
+	}
+}
+
+func TestGetInvoiceToleratesObjectSenderData(t *testing.T) {
+	// The create request models sender_branch_data as an object; if the GET
+	// response ever echoes it as an object instead of a string, the decode
+	// must still succeed.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v2/invoice/inv-obj", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"invoice_id": "inv-obj",
+			"invoice_status": "OPEN",
+			"sender_branch_data": {"register":"UZ96021105","name":"Branch 1","email":"b@example.com","phone":"88614450"},
+			"sender_staff_data": {"name":"Staff","email":"s@example.com","phone":"99001122"},
+			"sender_terminal_data": {"name": null},
+			"lines": []
+		}`))
+	})
+	client, _ := newMockClient(t, mux)
+
+	resp, err := client.GetInvoice(context.Background(), "inv-obj")
+	if err != nil {
+		t.Fatalf("GetInvoice: %v", err)
+	}
+	if resp.SenderBranchData == "" || resp.SenderStaffData == "" || resp.SenderTerminalData == "" {
+		t.Fatalf("object sender data must be preserved, got branch=%q staff=%q terminal=%q",
+			resp.SenderBranchData, resp.SenderStaffData, resp.SenderTerminalData)
+	}
+	if !strings.Contains(string(resp.SenderBranchData), "Branch 1") {
+		t.Fatalf("sender_branch_data must carry the object JSON, got %q", resp.SenderBranchData)
+	}
+}
+
+func TestGetInvoiceStringSenderDataStillWorks(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v2/invoice/inv-str", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"invoice_id": "inv-str",
+			"invoice_status": "CANCELED",
+			"sender_branch_data": "",
+			"sender_staff_data": "",
+			"sender_terminal_data": "",
+			"lines": []
+		}`))
+	})
+	client, _ := newMockClient(t, mux)
+
+	resp, err := client.GetInvoice(context.Background(), "inv-str")
+	if err != nil {
+		t.Fatalf("GetInvoice: %v", err)
+	}
+	if resp.InvoiceStatus != "CANCELED" {
+		t.Fatalf("got status %q, want CANCELED", resp.InvoiceStatus)
+	}
+	if resp.SenderBranchData != "" {
+		t.Fatalf("empty string sender data must stay empty, got %q", resp.SenderBranchData)
+	}
+}
+
+func TestCreateInvoiceSendsBooleanSwitchesExplicitly(t *testing.T) {
+	mux := http.NewServeMux()
+	var raw map[string]any
+	mux.HandleFunc("/v2/invoice", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&raw)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(invoiceResponseFixture))
+	})
+	client, _ := newMockClient(t, mux)
+
+	if _, err := client.CreateInvoice(context.Background(), CreateInvoiceRequest{
+		SenderInvoiceNo:     "inv-bools",
+		InvoiceReceiverCode: "r",
+		InvoiceDescription:  "d",
+		CallbackURL:         "https://example.com/cb",
+		Amount:              100,
+	}); err != nil {
+		t.Fatalf("CreateInvoice: %v", err)
+	}
+	for _, key := range []string{"enable_expiry", "calculate_vat", "allow_partial", "allow_exceed", "allow_subscribe"} {
+		if _, ok := raw[key]; !ok {
+			t.Fatalf("key %q must be sent explicitly (false), got body %v", key, raw)
+		}
 	}
 }

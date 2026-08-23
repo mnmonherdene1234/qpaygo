@@ -16,4 +16,10 @@
 //     independently confirm payment status via GetPayment or CheckPayment
 //     using your own bearer token before treating a payment as settled.
 //     VerifyCallback does this in one call.
+//
+// # Raw requests
+//
+// Request sends an authenticated request to any endpoint path and returns
+// the raw *http.Response. The caller owns the response and must close its
+// body (response.Body.Close()).
 package qpaygo

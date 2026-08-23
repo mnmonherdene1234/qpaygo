@@ -2,6 +2,7 @@ package qpaygo
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -11,6 +12,11 @@ import (
 // as a bare JSON number (e.g. 100.5) or as a quoted numeric string (e.g.
 // "100.50"). UnmarshalJSON accepts either; MarshalJSON always emits a bare
 // JSON number.
+//
+// NaN and ±Inf are rejected on both paths: MarshalJSON returns an error
+// (instead of emitting the invalid JSON tokens "NaN"/"+Inf"), and
+// UnmarshalJSON refuses to accept them so a poisoned value can never enter
+// a struct and break later marshaling.
 type Number float64
 
 // Float64 returns n as a float64.
@@ -33,16 +39,28 @@ func (n *Number) UnmarshalJSON(data []byte) error {
 	if err != nil {
 		return fmt.Errorf("qpaygo: invalid number %q: %w", s, err)
 	}
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return fmt.Errorf("qpaygo: non-finite number %q is not a valid JSON number", s)
+	}
 	*n = Number(f)
 	return nil
 }
 
 func (n Number) MarshalJSON() ([]byte, error) {
-	return []byte(strconv.FormatFloat(float64(n), 'f', -1, 64)), nil
+	f := float64(n)
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return nil, fmt.Errorf("qpaygo: cannot marshal non-finite number %v as JSON", f)
+	}
+	return []byte(strconv.FormatFloat(f, 'f', -1, 64)), nil
 }
 
 // TokenResponse is the OAuth2/Keycloak-style token payload returned by
 // POST /v2/auth/token and POST /v2/auth/refresh.
+//
+// ExpiresIn and RefreshExpiresIn hold the ABSOLUTE expiry instant in Unix
+// milliseconds after qpayWireExpiryMillis conversion (QPay sends absolute
+// Unix seconds on the wire); 0 means "no usable expiry". tokenPartExpired
+// is the only consumer of these values.
 type TokenResponse struct {
 	TokenType        string `json:"token_type"`
 	RefreshExpiresIn int64  `json:"refresh_expires_in"`
@@ -86,7 +104,10 @@ const (
 	ObjectTypeMerchant ObjectType = "MERCHANT" // valid for ListPayments only
 )
 
-// Offset paginates payment/check and payment/list requests.
+// Offset paginates payment/check and payment/list requests. QPay requires
+// both fields to be in [1, 100]; a zero Offset is therefore invalid on the
+// wire. CheckPaymentRequest treats Offset as optional (nil omits it);
+// ListPaymentsRequest defaults a nil Offset to {1, 100}.
 type Offset struct {
 	PageNumber int `json:"page_number"`
 	PageLimit  int `json:"page_limit"`

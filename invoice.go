@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"strings"
 )
 
 // Address is a postal address, used in invoice sender/receiver data.
@@ -101,6 +102,11 @@ type InvoiceTransaction struct {
 // CreateInvoiceRequest is the full-form request body for POST /v2/invoice,
 // supporting line items, discounts/surcharges/taxes, split-settlement
 // transactions, and subscription/tax configuration.
+//
+// Boolean switches are deliberately sent explicitly (no omitempty): QPay's
+// Postman examples always send "enable_expiry"/"calculate_vat"/... even when
+// false, and the doc does not document server-side defaults, so omitting a
+// false value could change server behavior if a default ever flips.
 type CreateInvoiceRequest struct {
 	InvoiceCode          string               `json:"invoice_code"`
 	SenderInvoiceNo      string               `json:"sender_invoice_no"`
@@ -113,9 +119,9 @@ type CreateInvoiceRequest struct {
 	InvoiceReceiverCode  string               `json:"invoice_receiver_code"`
 	InvoiceReceiverData  *ReceiverData        `json:"invoice_receiver_data,omitempty"`
 	InvoiceDescription   string               `json:"invoice_description"`
-	EnableExpiry         bool                 `json:"enable_expiry,omitempty"`
+	EnableExpiry         bool                 `json:"enable_expiry"`
 	ExpiryDate           string               `json:"expiry_date,omitempty"`
-	CalculateVAT         bool                 `json:"calculate_vat,omitempty"`
+	CalculateVAT         bool                 `json:"calculate_vat"`
 	TaxType              string               `json:"tax_type,omitempty"` // "1" VAT product | "2" no VAT | "3" VAT-exempt
 	TaxCustomerCode      string               `json:"tax_customer_code,omitempty"`
 	LineTaxCode          string               `json:"line_tax_code,omitempty"`
@@ -125,7 +131,7 @@ type CreateInvoiceRequest struct {
 	MaximumAmount        *Number              `json:"maximum_amount,omitempty"`
 	Amount               Number               `json:"amount,omitempty"` // omit when Lines carries the amount instead
 	CallbackURL          string               `json:"callback_url"`
-	AllowSubscribe       bool                 `json:"allow_subscribe,omitempty"`
+	AllowSubscribe       bool                 `json:"allow_subscribe"`
 	SubscriptionInterval string               `json:"subscription_interval,omitempty"`
 	SubscriptionWebhook  string               `json:"subscription_webhook,omitempty"`
 	Note                 string               `json:"note,omitempty"`
@@ -163,10 +169,30 @@ type InvoiceResponse struct {
 	URLs         []BankLink `json:"urls"`
 }
 
+// UnmarshalJSON decodes the invoice response tolerantly: the live API (and
+// every observed example) sends the per-bank deep links under "urls", but
+// QPay's official field table names the same array "qPay_deeplink". Accept
+// either key so URLs is never silently empty if QPay switches names.
+func (r *InvoiceResponse) UnmarshalJSON(data []byte) error {
+	type invoiceResponseAlias InvoiceResponse
+	var aux struct {
+		*invoiceResponseAlias
+		Deeplinks []BankLink `json:"qPay_deeplink"`
+	}
+	aux.invoiceResponseAlias = (*invoiceResponseAlias)(r)
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	if len(r.URLs) == 0 && len(aux.Deeplinks) > 0 {
+		r.URLs = aux.Deeplinks
+	}
+	return nil
+}
+
 // GetInvoiceResponse is returned by GetInvoice.
 type GetInvoiceResponse struct {
 	InvoiceID          string `json:"invoice_id"`
-	InvoiceStatus      string `json:"invoice_status"` // "OPEN" | "CLOSED"
+	InvoiceStatus      string `json:"invoice_status"` // "OPEN" | "CLOSED" | "CANCELED"
 	SenderInvoiceNo    string `json:"sender_invoice_no"`
 	SenderBranchCode   string `json:"sender_branch_code"`
 	SenderBranchData   string `json:"sender_branch_data"`
@@ -196,6 +222,54 @@ type GetInvoiceResponse struct {
 	// qpaygo guessing at an unverified shape.
 	Transactions []json.RawMessage `json:"transactions"`
 	Inputs       []json.RawMessage `json:"inputs"`
+}
+
+// UnmarshalJSON decodes the invoice GET response. The create request models
+// sender_branch_data / sender_staff_data / sender_terminal_data as objects,
+// but the GET response has been observed carrying them as empty strings. To
+// tolerate either shape without breaking the public string-typed fields,
+// object values are stored as their compact JSON representation.
+func (r *GetInvoiceResponse) UnmarshalJSON(data []byte) error {
+	type getInvoiceResponseAlias GetInvoiceResponse
+	var aux struct {
+		*getInvoiceResponseAlias
+		SenderBranchData   json.RawMessage `json:"sender_branch_data"`
+		SenderStaffData    json.RawMessage `json:"sender_staff_data"`
+		SenderTerminalData json.RawMessage `json:"sender_terminal_data"`
+	}
+	aux.getInvoiceResponseAlias = (*getInvoiceResponseAlias)(r)
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	r.SenderBranchData = rawJSONToString(aux.SenderBranchData)
+	r.SenderStaffData = rawJSONToString(aux.SenderStaffData)
+	r.SenderTerminalData = rawJSONToString(aux.SenderTerminalData)
+	return nil
+}
+
+// rawJSONToString converts a JSON value into a string: JSON strings come out
+// as-is, null/absent become "", and anything else (objects/arrays) becomes
+// its compact JSON representation.
+func rawJSONToString(raw json.RawMessage) string {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return ""
+	}
+	if len(trimmed) >= 2 && trimmed[0] == '"' {
+		var s string
+		if err := json.Unmarshal(raw, &s); err == nil {
+			return s
+		}
+		return string(raw)
+	}
+	var compact any
+	if err := json.Unmarshal(raw, &compact); err != nil {
+		return string(raw)
+	}
+	if b, err := json.Marshal(compact); err == nil {
+		return string(b)
+	}
+	return string(raw)
 }
 
 // CreateInvoice creates a full-form invoice via POST /v2/invoice, supporting

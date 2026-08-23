@@ -129,6 +129,10 @@ func (q *QPayClient) client() *http.Client {
 // not (yet) covered by a typed method. It ensures a valid access token is
 // present (refreshing/re-authenticating as needed) before sending the
 // request.
+//
+// The caller owns the returned *http.Response and MUST close its body
+// (response.Body.Close()) when done — unlike the typed methods, Request does
+// not decode or close the response for you.
 func (q *QPayClient) Request(ctx context.Context, method, path string, body any) (*http.Response, error) {
 	if err := q.CheckTokenAndRefresh(ctx); err != nil {
 		return nil, err

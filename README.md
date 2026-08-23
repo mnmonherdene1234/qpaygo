@@ -104,11 +104,13 @@ payment, err := client.GetPayment(ctx, "493622150113497")
 
 ## Төлбөр шалгах
 
+`Offset` сонголттой — `nil` үлдээвэл хүсэлтэд огт илгээгдэхгүй (QPay зөвшөөрдөг). Явуулахдаа `page_number`/`page_limit`-ийг **[1, 100]** дотор заавал өгнө — 0 утгатай offset-г QPay `MIN_NUMBER` алдаагаар татгалзана.
+
 ```go
 result, err := client.CheckPayment(ctx, qpaygo.CheckPaymentRequest{
 	ObjectType: qpaygo.ObjectTypeInvoice,
 	ObjectID:   "0c32b23f-f162-4caf-94dd-09a49952a9ba",
-	Offset:     qpaygo.Offset{PageNumber: 1, PageLimit: 100},
+	Offset:     &qpaygo.Offset{PageNumber: 1, PageLimit: 100},
 })
 ```
 
@@ -123,13 +125,17 @@ err  = client.RefundPayment(ctx, "493622150113497", qpaygo.RefundPaymentRequest{
 
 ## Төлбөрийн жагсаалт авах
 
+`Offset`-ийг `nil` орхивол `{1, 100}` гэж автоматаар бөглөнө (энэ endpoint-д QPay offset заавал шаарддаг).
+
+> **АНХААРУУЛГА:** `ObjectTypeMerchant`-ийн `object_id` нь access token-ийн JWT доторх **`merchant_id` (UUID)** байна — invoice code БИШ. Invoice code явуулбал `401 PERMISSION_DENIED` буцна. `ObjectTypeInvoice`-ийн `object_id` нь харин invoice code.
+
 ```go
 list, err := client.ListPayments(ctx, qpaygo.ListPaymentsRequest{
 	ObjectType: qpaygo.ObjectTypeMerchant,
-	ObjectID:   "merchant-code",
+	ObjectID:   "1c46a9ec-3045-4341-adb9-ffe6feb9d0df", // merchant UUID (JWT-ийн merchant_id claim)
 	StartDate:  qpaygo.FormatQPayTime(time.Now().AddDate(0, 0, -7)),
 	EndDate:    qpaygo.FormatQPayTime(time.Now()),
-	Offset:     qpaygo.Offset{PageNumber: 1, PageLimit: 100},
+	Offset:     &qpaygo.Offset{PageNumber: 1, PageLimit: 100},
 })
 ```
 
@@ -182,6 +188,11 @@ if errors.As(err, &apiErr) {
 		// ...
 	case qpaygo.ErrPaymentSettled:
 		// картын бус гүйлгээг цуцлах/буцаах гэж оролдсон
+	case qpaygo.ErrNoCredentialsProduction:
+		// access token хүчингүй/хугацаа дууссан — шинэ клиент үүсгэх
+		// (production-ийн бичиглэл; sandbox нь ErrNoCredentials илгээдэг)
+	case qpaygo.ErrSystemBusy:
+		// QPay талын түр зуурын алдаа (500)
 	}
 }
 ```
@@ -192,6 +203,10 @@ if errors.As(err, &apiErr) {
 
 ```go
 response, err := client.Request(ctx, http.MethodGet, "/v2/invoice/"+invoiceID, nil)
+if err != nil {
+	return err
+}
+defer response.Body.Close() // Request танд raw response өгдөг — body-г өөрөө хаах ёстой
 ```
 
 ## Тест ажиллуулах

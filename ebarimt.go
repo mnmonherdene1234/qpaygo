@@ -77,6 +77,10 @@ type EbarimtHistory struct {
 }
 
 // EbarimtResponse is returned by CreateEbarimt and GetEbarimt.
+//
+// QPay's official field table is riddled with typos that contradict its own
+// JSON example body (the example uses barimt_status / merchant_register_no /
+// ebarimt_receiver_type, which this struct follows).
 type EbarimtResponse struct {
 	ID                   string              `json:"id"`
 	EbarimtBy            string              `json:"ebarimt_by"`

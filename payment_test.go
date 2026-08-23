@@ -84,7 +84,7 @@ func TestCheckPaymentNoneYet(t *testing.T) {
 	resp, err := client.CheckPayment(context.Background(), CheckPaymentRequest{
 		ObjectType: ObjectTypeInvoice,
 		ObjectID:   "inv-1",
-		Offset:     Offset{PageNumber: 1, PageLimit: 100},
+		Offset:     &Offset{PageNumber: 1, PageLimit: 100},
 	})
 	if err != nil {
 		t.Fatalf("CheckPayment: %v", err)
@@ -210,5 +210,165 @@ func TestListPaymentsUsesPaidBy(t *testing.T) {
 	}
 	if len(resp.Rows) != 1 || resp.Rows[0].TransportType != TransportP2P {
 		t.Fatalf("got rows %+v", resp.Rows)
+	}
+}
+
+func TestCheckPaymentOmitsNilOffset(t *testing.T) {
+	mux := http.NewServeMux()
+	var raw map[string]any
+	mux.HandleFunc("/v2/payment/check", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&raw)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"count":0,"rows":[]}`))
+	})
+	client, _ := newMockClient(t, mux)
+
+	if _, err := client.CheckPayment(context.Background(), CheckPaymentRequest{
+		ObjectType: ObjectTypeInvoice,
+		ObjectID:   "inv-1",
+		// Offset intentionally left nil.
+	}); err != nil {
+		t.Fatalf("CheckPayment: %v", err)
+	}
+	if _, ok := raw["offset"]; ok {
+		t.Fatalf("offset must be omitted when nil, got body %v", raw)
+	}
+}
+
+func TestCheckPaymentSendsExplicitOffset(t *testing.T) {
+	mux := http.NewServeMux()
+	var raw map[string]any
+	mux.HandleFunc("/v2/payment/check", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&raw)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"count":0,"rows":[]}`))
+	})
+	client, _ := newMockClient(t, mux)
+
+	if _, err := client.CheckPayment(context.Background(), CheckPaymentRequest{
+		ObjectType: ObjectTypeInvoice,
+		ObjectID:   "inv-1",
+		Offset:     &Offset{PageNumber: 2, PageLimit: 50},
+	}); err != nil {
+		t.Fatalf("CheckPayment: %v", err)
+	}
+	off, ok := raw["offset"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected offset object in body, got %v", raw["offset"])
+	}
+	if off["page_number"] != float64(2) || off["page_limit"] != float64(50) {
+		t.Fatalf("got offset %v", off)
+	}
+}
+
+func TestListPaymentsDefaultsNilOffset(t *testing.T) {
+	mux := http.NewServeMux()
+	var gotBody ListPaymentsRequest
+	mux.HandleFunc("/v2/payment/list", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"count":0,"rows":[]}`))
+	})
+	client, _ := newMockClient(t, mux)
+
+	if _, err := client.ListPayments(context.Background(), ListPaymentsRequest{
+		ObjectType: ObjectTypeMerchant,
+		ObjectID:   "merchant-1",
+		StartDate:  "2022-03-01 00:00:00",
+		EndDate:    "2022-03-31 23:59:59",
+		// Offset intentionally nil — must default to {1,100}.
+	}); err != nil {
+		t.Fatalf("ListPayments: %v", err)
+	}
+	if gotBody.Offset == nil || gotBody.Offset.PageNumber != 1 || gotBody.Offset.PageLimit != 100 {
+		t.Fatalf("got offset %+v, want default {1,100}", gotBody.Offset)
+	}
+}
+
+func TestPaymentCheckRowDecodesLiveFields(t *testing.T) {
+	// Live row shape includes ebarimt_customer_no and card rows using the
+	// check-endpoint aliases amount/currency/date/status.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v2/payment/check", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"count": 1,
+			"paid_amount": 9500,
+			"rows": [
+				{
+					"payment_id":"p1","payment_status":"PAID","payment_amount":"9500.00",
+					"ebarimt_customer_no":null,"trx_fee":"95.00","payment_currency":"MNT",
+					"payment_wallet":"Candy pay","payment_type":"CARD",
+					"card_transactions":[
+						{"card_type":"VISA","is_cross_border":false,"amount":"200.00","currency":"MNT","date":"2022-03-11T05:57:47.336Z","status":"SUCCESS","settlement_status":"SETTLED","settlement_status_date":"2022-03-12T05:57:47.336Z"}
+					]
+				}
+			]
+		}`))
+	})
+	client, _ := newMockClient(t, mux)
+
+	resp, err := client.CheckPayment(context.Background(), CheckPaymentRequest{
+		ObjectType: ObjectTypeInvoice,
+		ObjectID:   "inv-1",
+	})
+	if err != nil {
+		t.Fatalf("CheckPayment: %v", err)
+	}
+	row := resp.Rows[0]
+	if len(row.CardTransactions) != 1 {
+		t.Fatalf("got card transactions %+v", row.CardTransactions)
+	}
+	card := row.CardTransactions[0]
+	if card.Amount.Float64() != 200 || card.Currency != "MNT" || card.Date == "" || card.Status != "SUCCESS" || card.CardType != "VISA" {
+		t.Fatalf("check-row card aliases not decoded: %+v", card)
+	}
+}
+
+func TestGetPaymentCardAliasesAlsoWork(t *testing.T) {
+	// The GetPayment card schema (transaction_* names) must still decode.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v2/payment/pay-2", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"payment_id": "pay-2",
+			"payment_status": "PAID",
+			"transaction_type": "CARD",
+			"card_transactions": [
+				{"card_merchant_code":"m1","card_terminal_code":"t1","card_number":"411111******1111","card_type":"VISA","is_cross_border":false,"transaction_amount":"200.00","transaction_currency":"MNT","transaction_date":"2022-03-11T05:57:47.336Z","transaction_status":"APPROVED","settlement_status":"DONE","settlement_status_date":"2022-03-11T05:57:47.336Z"}
+			]
+		}`))
+	})
+	client, _ := newMockClient(t, mux)
+
+	resp, err := client.GetPayment(context.Background(), "pay-2")
+	if err != nil {
+		t.Fatalf("GetPayment: %v", err)
+	}
+	card := resp.CardTransactions[0]
+	if card.TransactionAmount.Float64() != 200 || card.TransactionStatus != "APPROVED" || card.CardType != "VISA" {
+		t.Fatalf("get-payment card fields not decoded: %+v", card)
+	}
+}
+
+func TestP2PTransactionDecodesID(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v2/payment/pay-3", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"payment_id":"pay-3","payment_status":"PAID","transaction_type":"P2P",
+			"p2p_transactions":[
+				{"id":"172641734354765","transaction_bank_code":"990000","account_bank_code":"990000","account_bank_name":"Мобифинанс","account_number":"42005000001","status":"SUCCESS","amount":"95.00","currency":"MNT","settlement_status":"SETTLED"}
+			]
+		}`))
+	})
+	client, _ := newMockClient(t, mux)
+
+	resp, err := client.GetPayment(context.Background(), "pay-3")
+	if err != nil {
+		t.Fatalf("GetPayment: %v", err)
+	}
+	if resp.P2PTransactions[0].ID != "172641734354765" {
+		t.Fatalf("p2p id not decoded: %+v", resp.P2PTransactions[0])
 	}
 }
